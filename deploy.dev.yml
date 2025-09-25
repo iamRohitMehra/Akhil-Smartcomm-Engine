@@ -1,0 +1,66 @@
+name: Deploy Lambda and API
+
+on:
+  push:
+    branches: [non-prod]
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  STACK_NAME: SmartCommStack
+  S3_BUCKET: smart-commengine-bucket
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials using OIDC
+        uses: aws-actions/configure-aws-credentials@v3
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME_NON_PROD }}
+          aws-region: us-east-1
+
+      # Package Lambda functions and upload to S3
+      - name: Package Lambda functions
+        run: |
+          commit_hash=$(git rev-parse --short HEAD)
+          echo "Commit hash: $commit_hash"
+
+          mkdir -p build
+          zip -j build/checkstatus.zip lambda/smartcomm-check-status/*.py
+          zip -j build/generatedoc.zip lambda/smartcomm-doc-generator/*.py
+
+          CHECK_KEY="checkstatus-$commit_hash.zip"
+          DOC_KEY="generatedoc-$commit_hash.zip"
+
+          aws s3 cp build/checkstatus.zip s3://smart-commengine-bucket/$CHECK_KEY --region us-east-1
+          aws s3 cp build/generatedoc.zip s3://smart-commengine-bucket/$DOC_KEY --region us-east-1
+
+          echo "CHECK_KEY=$CHECK_KEY" >> $GITHUB_ENV
+          echo "DOC_KEY=$DOC_KEY" >> $GITHUB_ENV
+
+      # Deploy CloudFormation stack with S3 bucket parameter
+      - name: Deploy CloudFormation stack
+        run: |
+          aws cloudformation deploy \
+            --template-file cloudformation/template.yaml \
+            --stack-name SmartCommStack \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --region us-east-1 \
+            --parameter-overrides \
+              GitHubActionAssumeRoleWithActionArn=arn:aws:iam::9892857544:role/GitHubAction-AssumeRoleWithAction \
+              DeploymentS3Bucket=smart-commengine-bucket \
+              CheckStatusS3Key=${CHECK_KEY} \
+              GenerateDocS3Key=${DOC_KEY} \
+              SecretArn=arn:aws:secretsmanager:us-east-1:9892857544:secret:smartcomm/credentials -(yours)
+
+          echo "Deployment completed successfully"
+
