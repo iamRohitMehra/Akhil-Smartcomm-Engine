@@ -2,7 +2,7 @@ name: Deploy Lambda and API
 
 on:
   push:
-    branches: [non-prod]
+    branches: [prod]
   workflow_dispatch:
 
 permissions:
