@@ -1,0 +1,197 @@
+Description: Infra for SmartComm Lambdas and API Gateway
+# This template defines the infrastructure for the Smart Communications Lambda functions and API Gateway.
+
+Parameters:
+  DeploymentS3Bucket:
+    Type: String
+    Description: Name of existing S3 bucket containing Lambda deployment packages
+  CheckStatusS3Key:
+    Type: String
+  GenerateDocS3Key:
+    Type: String
+  GitHubActionAssumeRoleWithActionArn:
+    Type: String
+    Description: ARN of the existing GitHub Action Assume Role with Action
+  SecretArn:
+    Type: String
+    Description: arn:aws:secretsmanager:us-east-1:98957544:secret:smartcomm/credentials
+
+Resources:
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: LambdaInlineExecutionRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ReadSmartCommSecret
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ReadSecret
+                Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:DescribeSecret
+                Resource: !Sub "${SecretArn}"
+
+  SmartCommLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      LayerName: smart-comm-python-deps
+      CompatibleRuntimes:
+        - python3.11
+      Content:
+        S3Bucket: !Ref DeploymentS3Bucket
+        S3Key: layer.zip
+
+  CheckStatusFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: smartcomm-check-status
+      Handler: lambda_handler.lambda_handler
+      Runtime: python3.11
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        S3Bucket: !Ref DeploymentS3Bucket
+        S3Key: !Ref CheckStatusS3Key
+      Environment:
+        Variables:
+          SMARTCOMM_SECRET_ARN: !Ref SecretArn
+          SMART_AWS_REGION: "us-east-1"
+          AUTH_SECRET_NAME: "smartcomm/credentials"
+          S3_BUCKET_NAME: "smart-communication-nonprod-output"
+          JOB_STATUS_URL: "https://na10-"
+      Timeout: 120
+      Layers:
+        - !Ref SmartCommLayer
+
+  GenerateDocFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: smartcomm-generate-doc
+      Handler: main.lambda_handler
+      Runtime: python3.11
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        S3Bucket: !Ref DeploymentS3Bucket
+        S3Key: !Ref GenerateDocS3Key
+      Environment:
+        Variables:
+          SMARTCOMM_SECRET_ARN: !Ref SecretArn
+          MONGO_URI: "mongodb+srv://byaddanapalli:M"
+          JOB_CREATION_URL: "https://na10-sb."
+          SMART_AWS_REGION: "us-east-1"
+          SECRET_NAME: "smartcomm/credentials"
+          DATABASE: "PublicRisk"
+          S3_BUCKET_NAME: "smart-communication-nonprod-input"
+      Timeout: 120
+      Layers:
+        - !Ref SmartCommLayer
+
+  RestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: SmartCommAPI
+
+  # /PRGCheckStatus
+  CheckStatusResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !GetAtt RestApi.RootResourceId
+      PathPart: PRGCheckStatus
+
+  # /PRGCheckStatus/{jobId}
+  CheckStatusJobIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref CheckStatusResource
+      PathPart: "{jobId}"
+
+  # GET /PRGCheckStatus/{jobId}
+  CheckStatusJobIdMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: GET
+      ResourceId: !Ref CheckStatusJobIdResource
+      RestApiId: !Ref RestApi
+      RequestParameters:
+        method.request.path.jobId: true
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${CheckStatusFunction.Arn}/invocations
+
+  # /PRGGenerateDocument
+  GenerateDocResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !GetAtt RestApi.RootResourceId
+      PathPart: PRGGenerateDocument
+
+  # POST /PRGGenerateDocument
+  GenerateDocMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: POST
+      ResourceId: !Ref GenerateDocResource
+      RestApiId: !Ref RestApi
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GenerateDocFunction.Arn}/invocations
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - GenerateDocMethod
+      - CheckStatusJobIdMethod
+    Properties:
+      RestApiId: !Ref RestApi
+
+  ApiStageNonProd:
+    Type: AWS::ApiGateway::Stage
+    DependsOn:
+      - GenerateDocMethod
+      - CheckStatusJobIdMethod
+    Properties:
+      StageName: nonprod
+      DeploymentId: !Ref ApiDeployment
+      RestApiId: !Ref RestApi
+
+  LambdaPermissionCheckStatusJobId:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CheckStatusFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}//GET/PRGCheckStatus/
+
+  LambdaPermissionGenerateDoc:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref GenerateDocFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*/POST/PRGGenerateDocument
+
+Outputs:
+  CheckStatusURL:
+    Value: !Sub https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/nonprod/PRGCheckStatus/{jobId}
+  GenerateDocURL:
+    Value: !Sub https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/nonprod/PRGGenerateDocument
+  GitHubActionAssumeRoleWithActionArn:
+    Value: !Ref GitHubActionAssumeRoleWithActionArn
